@@ -55,8 +55,8 @@ def detect_file_type(uploaded_file):
     else:
         text = raw.decode("utf-8", errors="ignore")
 
-    # EP실적 파일 특징: "트래픽", "거래액", "구매객수", "CR", "객단가" 가 들어있음
-    if "트래픽" in text and "객단가" in text:
+    # EP실적 파일 특징: "트래픽"과 "회원구분" 또는 "구분"이 들어있음
+    if "트래픽" in text and ("회원구분" in text or "구분" in text):
         return "ep_traffic"
     # EP채널 파일 특징: "평균 EP" 또는 "원부매칭" 이 들어있음
     if "평균 EP" in text or "원부매칭" in text:
