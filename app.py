@@ -160,11 +160,20 @@ def convert_ep_traffic(uploaded_file):
     ]
 
     rows = []
+    # 세그먼트 매핑: (출력 라벨, 회원구분 필터값, 신규구분1 필터값)
+    SEGMENTS = [
+        ("전체", "전체", "전체"),
+        ("회원", "회원", "전체"),
+        ("비회원", "비회원", "전체"),
+        ("신규", "전체", "신규"),
+        ("기존", "전체", "기존"),
+    ]
+
     for bpu_label, gubun, bpu_val in targets:
         for metric in ["트래픽", "거래액", "구매객수", "CR", "객단가"]:
-            for member in ["전체", "회원", "비회원"]:
-                mask = ((col0 == metric) & (df.iloc[:, 1] == member) &
-                        (df.iloc[:, 2] == "전체") & (df.iloc[:, 3] == "전체") &
+            for seg_label, member_filter, sinew_filter in SEGMENTS:
+                mask = ((col0 == metric) & (df.iloc[:, 1] == member_filter) &
+                        (df.iloc[:, 2] == sinew_filter) & (df.iloc[:, 3] == "전체") &
                         (df.iloc[:, 4] == gubun) & (df.iloc[:, 5] == bpu_val))
                 matched = df[mask]
                 if matched.empty:
@@ -177,7 +186,7 @@ def convert_ep_traffic(uploaded_file):
                     except:
                         val = None
                     rows.append({"날짜": date_str, "BPU": bpu_label,
-                                 "회원구분": member, "지표": metric, "값": val})
+                                 "회원구분": seg_label, "지표": metric, "값": val})
 
     long = pd.DataFrame(rows)
     pivot = long.pivot_table(index=["날짜", "BPU", "회원구분"],
