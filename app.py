@@ -325,6 +325,7 @@ st.markdown(
     "<div style='background:#f0f4ff;border-radius:8px;padding:12px 16px;margin:8px 0 16px;font-size:0.88rem;'>"
     "📁 <b>EP채널 데이터</b> (Data.xlsx / Data.csv) → <code>ep_data_long.csv</code><br/>"
     "📁 <b>EP실적 데이터</b> (1_EP실적.csv) → <code>ep_traffic.csv</code><br/>"
+    "📁 <b>EP실적(카테고리 포함)</b> 파일이면 → <code>ep_category.csv</code>도 함께 생성<br/>"
     "파일을 올리면 자동으로 종류를 판별합니다."
     "</div>",
     unsafe_allow_html=True,
