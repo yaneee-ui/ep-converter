@@ -141,16 +141,25 @@ def convert_ep_traffic(uploaded_file):
         df = pd.read_csv(uploaded_file, encoding="utf-8-sig", sep=None,
                          engine="python", header=None, low_memory=False)
 
-    col0 = df.iloc[:, 0].ffill()
+    # --- 구조 자동 판별 ---
+    header_row0 = str(df.iloc[0, 0]).strip()
+    if header_row0 == "BPU" or header_row0 in ("e-영업1", "e-영업2", "e-영업3", "e-영업4"):
+        # 새 구조: 열0=BPU, 열1=지표, 열2=회원구분, 열3=신규구분1, 열4=신규구분2, 열5=카테고리, 열6=브랜드, 열7~=날짜
+        return _convert_traffic_new(df)  # (ep_traffic_df, ep_category_df_or_None)
+    else:
+        # 기존 구조: 열0=지표, 열1=회원구분, 열2=신규구분1, 열3=신규구분2, 열4=구분, 열5=BPU, 열6~=날짜
+        return _convert_traffic_old(df), None
 
-    # 날짜 열 인덱스
+
+def _convert_traffic_old(df):
+    """기존 EP실적 구조 (열0=지표, 열5=BPU, 열4=구분)."""
+    col0 = df.iloc[:, 0].ffill()
     date_cols = {}
     for c in range(6, df.shape[1]):
         v = str(df.iloc[0, c])
         if v.startswith("20"):
             date_cols[v] = c
 
-    # 추출 대상: Total=구분전체/BPU전체, BPU별=구분기본
     targets = [
         ("Total", "전체", "전체"),
         ("e-영업1", "기본", "e-영업1"),
@@ -158,9 +167,6 @@ def convert_ep_traffic(uploaded_file):
         ("e-영업3", "기본", "e-영업3"),
         ("e-영업4", "기본", "e-영업4"),
     ]
-
-    rows = []
-    # 세그먼트 매핑: (출력 라벨, 회원구분 필터값, 신규구분1 필터값)
     SEGMENTS = [
         ("전체", "전체", "전체"),
         ("회원", "회원", "전체"),
@@ -169,6 +175,7 @@ def convert_ep_traffic(uploaded_file):
         ("기존", "전체", "기존"),
     ]
 
+    rows = []
     for bpu_label, gubun, bpu_val in targets:
         for metric in ["트래픽", "거래액", "구매객수", "CR", "객단가"]:
             for seg_label, member_filter, sinew_filter in SEGMENTS:
@@ -187,13 +194,127 @@ def convert_ep_traffic(uploaded_file):
                         val = None
                     rows.append({"날짜": date_str, "BPU": bpu_label,
                                  "회원구분": seg_label, "지표": metric, "값": val})
+    return _pivot_traffic(rows)
 
+
+def _convert_traffic_new(df):
+    """새 EP실적 구조 (열0=BPU, 열1=지표, 열5=카테고리, 열6=브랜드).
+    Total 행이 없으므로 BPU 합산으로 만든다.
+    반환: (ep_traffic 형태 DataFrame, ep_category 형태 DataFrame or None)
+    """
+    bpu_col = df.iloc[:, 0].ffill()
+
+    date_cols = {}
+    for c in range(7, df.shape[1]):
+        v = str(df.iloc[0, c])
+        if v.startswith("20"):
+            date_cols[v] = c
+    date_list = list(date_cols.items())
+
+    SEGMENTS = [
+        ("전체", "전체", "전체"),
+        ("회원", "회원", "전체"),
+        ("비회원", "비회원", "전체"),
+        ("신규", "전체", "신규"),
+        ("기존", "전체", "기존"),
+    ]
+
+    # ── 1. ep_traffic (카테고리=전체,브랜드=전체, 5개 세그먼트) ──
+    rows = []
+    for bpu in ["e-영업1", "e-영업2", "e-영업3", "e-영업4"]:
+        for metric in ["트래픽", "거래액", "구매객수", "CR", "객단가"]:
+            for seg_label, member_filter, sinew_filter in SEGMENTS:
+                mask = ((bpu_col == bpu) & (df.iloc[:, 1] == metric) &
+                        (df.iloc[:, 2] == member_filter) & (df.iloc[:, 3] == sinew_filter) &
+                        (df.iloc[:, 4] == "전체") & (df.iloc[:, 5] == "전체") & (df.iloc[:, 6] == "전체"))
+                matched = df[mask]
+                if matched.empty:
+                    continue
+                row_data = matched.iloc[0]
+                for date_str, col_idx in date_list:
+                    val = str(row_data.iloc[col_idx]).replace(",", "").replace("%", "")
+                    try:
+                        val = float(val)
+                    except:
+                        val = None
+                    rows.append({"날짜": date_str, "BPU": bpu,
+                                 "회원구분": seg_label, "지표": metric, "값": val})
+
+    pivot = _pivot_traffic(rows)
+
+    # Total 행 생성 (BPU 합산, CR/객단가는 재계산)
+    total_rows = []
+    for date_str in sorted(date_cols.keys()):
+        for seg_label, _, _ in SEGMENTS:
+            sub = pivot[(pivot["날짜"] == date_str) & (pivot["회원구분"] == seg_label)]
+            if sub.empty:
+                continue
+            row = {"날짜": date_str, "BPU": "Total", "회원구분": seg_label}
+            for col in ["트래픽", "거래액", "구매객수"]:
+                if col in sub.columns:
+                    row[col] = sub[col].sum()
+            if row.get("트래픽", 0) > 0:
+                row["CR"] = row.get("구매객수", 0) / row["트래픽"] * 100
+            else:
+                row["CR"] = 0
+            if row.get("구매객수", 0) > 0:
+                row["객단가"] = row.get("거래액", 0) / row["구매객수"]
+            else:
+                row["객단가"] = 0
+            total_rows.append(row)
+
+    total_df = pd.DataFrame(total_rows)
+    ep_traffic_result = pd.concat([pivot, total_df], ignore_index=True)
+    ep_traffic_result = ep_traffic_result.sort_values(["BPU", "회원구분", "날짜"]).reset_index(drop=True)
+
+    # ── 2. ep_category (카테고리/브랜드 전체 조합, 세그먼트=전체만, groupby로 빠르게) ──
+    combos = df.iloc[1:, [5, 6]].drop_duplicates().values.tolist()
+    ep_category_result = None
+    if len(combos) > 1:  # 카테고리 breakdown이 실제로 있는 파일일 때만
+        cat_mask = (df.iloc[:, 2] == "전체") & (df.iloc[:, 3] == "전체") & (df.iloc[:, 4] == "전체") \
+                   & df.iloc[:, 0].notna()
+        sub_df = df[cat_mask].copy()
+        sub_df["_bpu"] = bpu_col[cat_mask]
+
+        date_col_indices = [idx for _, idx in date_list]
+        date_strs = [d for d, _ in date_list]
+
+        cat_rows = []
+        for metric in ["트래픽", "거래액", "구매객수", "CR", "객단가"]:
+            metric_rows = sub_df[sub_df.iloc[:, 1] == metric]
+            for _, r in metric_rows.iterrows():
+                bpu_val = r["_bpu"]
+                cat_val = r.iloc[5]
+                brand_val = r.iloc[6]
+                for date_str, col_idx in date_list:
+                    v = str(r.iloc[col_idx]).replace(",", "").replace("%", "")
+                    try:
+                        v = float(v)
+                    except:
+                        v = None
+                    cat_rows.append({
+                        "날짜": date_str, "BPU": bpu_val, "카테고리": cat_val,
+                        "브랜드": brand_val, "지표": metric, "값": v,
+                    })
+        cat_long = pd.DataFrame(cat_rows)
+        cat_pivot = cat_long.pivot_table(
+            index=["날짜", "BPU", "카테고리", "브랜드"], columns="지표", values="값", aggfunc="first"
+        ).reset_index()
+        cat_pivot.columns.name = None
+        ep_category_result = cat_pivot.sort_values(["BPU", "카테고리", "브랜드", "날짜"]).reset_index(drop=True)
+
+    return ep_traffic_result, ep_category_result
+
+
+def _pivot_traffic(rows):
+    """rows 리스트를 피벗해서 정리된 DataFrame 반환."""
     long = pd.DataFrame(rows)
+    if long.empty:
+        return long
     pivot = long.pivot_table(index=["날짜", "BPU", "회원구분"],
                              columns="지표", values="값", aggfunc="first").reset_index()
     pivot.columns.name = None
-    pivot = pivot.sort_values(["BPU", "회원구분", "날짜"]).reset_index(drop=True)
-    return pivot
+    return pivot.sort_values(["BPU", "회원구분", "날짜"]).reset_index(drop=True)
 
 
 # ─── UI ───
@@ -223,12 +344,13 @@ if uploaded is not None:
 
     st.info(f"🔍 **{type_label}**로 판별됨 → `{out_name}` 생성")
 
-    with st.spinner("변환 중... (보통 10~30초)"):
+    with st.spinner("변환 중... (파일 크기에 따라 최대 1~2분 소요될 수 있어요)"):
         try:
             if file_type == "ep_channel":
                 result = convert_ep_channel(uploaded, uploaded.name)
+                category_result = None
             else:
-                result = convert_ep_traffic(uploaded)
+                result, category_result = convert_ep_traffic(uploaded)
         except Exception as e:
             st.error(f"변환 실패: {e}")
             st.stop()
@@ -266,7 +388,20 @@ if uploaded is not None:
         use_container_width=True, type="primary",
     )
 
+    # 카테고리/브랜드 데이터가 함께 추출됐으면 별도 다운로드 제공
+    if category_result is not None and not category_result.empty:
+        st.divider()
+        n_cats = category_result["카테고리"].nunique()
+        n_brands = category_result["브랜드"].nunique()
+        st.info(f"🗂️ 카테고리/브랜드 상세 데이터도 함께 발견됐어요 (카테고리 {n_cats}개, 브랜드 {n_brands}개) → `ep_category.csv` 생성")
+        cat_csv = category_result.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+        st.download_button(
+            "⬇️ ep_category.csv 다운로드",
+            cat_csv, file_name="ep_category.csv", mime="text/csv",
+            use_container_width=True,
+        )
+
     st.divider()
-    st.markdown(f"**다운로드한 `{out_name}`을 GitHub에 덮어쓰면 대시보드가 갱신됩니다.**")
+    st.markdown(f"**다운로드한 파일을 GitHub에 덮어쓰면 대시보드가 갱신됩니다.**")
     with st.expander("미리보기 (처음 10행)"):
         st.dataframe(result.head(10), use_container_width=True, hide_index=True)
