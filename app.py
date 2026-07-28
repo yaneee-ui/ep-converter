@@ -317,106 +317,230 @@ def _pivot_traffic(rows):
     return pivot.sort_values(["BPU", "회원구분", "날짜"]).reset_index(drop=True)
 
 
+def merge_other_dept(traffic_df, other_file):
+    """기타부서 원본(xlsx)을 읽어 Total(회원구분=전체) 행의 트래픽/거래액에 더하고
+    CR/객단가를 재계산한다. 구매객수는 원본에 없으므로 그대로 둔다."""
+    odf = pd.read_excel(other_file, sheet_name=0)
+    date_cols = [c for c in odf.columns if str(c).startswith("20")]
+    if not date_cols:
+        raise ValueError("날짜 컬럼을 찾지 못했습니다.")
+    metric_col = odf.columns[0]
+
+    other_daily = {}
+    for metric in ["트래픽", "거래액"]:
+        match = odf[odf[metric_col] == metric]
+        if match.empty:
+            continue
+        row = match.iloc[0]
+        for c in date_cols:
+            v = row[c]
+            try:
+                v = float(v)
+            except (TypeError, ValueError):
+                v = 0.0
+            other_daily.setdefault(pd.Timestamp(c).strftime("%Y-%m-%d"), {})[metric] = v
+
+    merged = traffic_df.copy()
+    mask_total = (merged["BPU"] == "Total") & (merged["회원구분"] == "전체")
+    n_adjusted = 0
+    for idx in merged[mask_total].index:
+        date_str = merged.at[idx, "날짜"]
+        add = other_daily.get(str(date_str))
+        if not add:
+            continue
+        add_uv = add.get("트래픽", 0.0)
+        add_gmv = add.get("거래액", 0.0)
+        if add_uv == 0 and add_gmv == 0:
+            continue
+        merged.at[idx, "트래픽"] = merged.at[idx, "트래픽"] + add_uv
+        merged.at[idx, "거래액"] = merged.at[idx, "거래액"] + add_gmv
+        # CR/객단가 재계산 (구매객수는 기타부서 데이터가 없어 그대로 유지)
+        buyers = merged.at[idx, "구매객수"]
+        new_uv = merged.at[idx, "트래픽"]
+        new_gmv = merged.at[idx, "거래액"]
+        merged.at[idx, "CR"] = (buyers / new_uv * 100) if new_uv > 0 else 0
+        merged.at[idx, "객단가"] = (new_gmv / buyers) if buyers > 0 else 0
+        n_adjusted += 1
+
+    return merged, n_adjusted
+
+
 # ─── UI ───
 st.markdown("## 🔄 EP 데이터 변환기")
 st.markdown("사내에서 받은 원본 파일을 대시보드용 CSV로 변환합니다.")
 
 st.markdown(
-    "<div style='background:#f0f4ff;border-radius:8px;padding:12px 16px;margin:8px 0 16px;font-size:0.88rem;'>"
-    "📁 <b>EP채널 데이터</b> (Data.xlsx / Data.csv) → <code>ep_data_long.csv</code><br/>"
-    "📁 <b>EP실적 데이터</b> (1_EP실적.csv) → <code>ep_traffic.csv</code><br/>"
-    "📁 <b>EP실적(카테고리 포함)</b> 파일이면 → <code>ep_category.csv</code>도 함께 생성<br/>"
-    "파일을 올리면 자동으로 종류를 판별합니다."
+    "<div style='background:#f0f4ff;border-radius:8px;padding:12px 16px;margin:8px 0 16px;font-size:0.86rem;'>"
+    "각 파일을 <b>맞는 슬롯에</b> 올려주세요. 슬롯마다 결과 파일이 정해져 있어서, "
+    "카테고리 포함 파일을 잘못된 슬롯에 올려도 섞이지 않아요.<br/><br/>"
+    "① <b>EP채널 데이터</b> (Data.xlsx/csv) → <code>ep_data_long.csv</code><br/>"
+    "② <b>EP실적 데이터 (카테고리 구분 없는 집계 파일)</b> → <code>ep_traffic.csv</code> "
+    "· <span style='color:#dc2626'>이 슬롯엔 반드시 카테고리/브랜드 구분이 없는 순수 집계 파일만 올려주세요</span><br/>"
+    "③ <b>EP실적(카테고리·브랜드 포함) 데이터</b> → <code>ep_category.csv</code> "
+    "· <span style='color:#dc2626'>이 슬롯에서 나오는 ep_traffic.csv는 사용하지 않습니다 (중복 카운트가 섞여 있어서 부정확함)</span>"
     "</div>",
     unsafe_allow_html=True,
 )
 
-uploaded = st.file_uploader("사내 원본 파일을 올려주세요", type=["csv", "xlsx", "xls"])
+tab1, tab2, tab3 = st.tabs(["① EP채널", "② EP실적 (집계)", "③ EP실적 (카테고리 포함)"])
 
-if uploaded is not None:
-    file_type = detect_file_type(uploaded)
+# ── ① EP채널 ──
+with tab1:
+    st.caption("Data.xlsx / Data.csv — 원부매칭율/최저가율 등")
+    up_channel = st.file_uploader("EP채널 원본 업로드", type=["csv", "xlsx", "xls"], key="up_channel")
+    if up_channel is not None:
+        detected = detect_file_type(up_channel)
+        if detected != "ep_channel":
+            st.error("EP채널 데이터로 보이지 않아요. ②나 ③ 탭에 올리려던 파일은 아닌가요?")
+        else:
+            with st.spinner("변환 중..."):
+                try:
+                    result = convert_ep_channel(up_channel, up_channel.name)
+                except Exception as e:
+                    st.error(f"변환 실패: {e}")
+                    st.stop()
+            date_min, date_max = result["날짜"].min(), result["날짜"].max()
+            st.success("변환 완료!")
+            c1, c2, c3 = st.columns(3)
+            c1.metric("기간", f"{date_min} ~ {date_max}")
+            c2.metric("일수", f"{result['날짜'].nunique()}일")
+            c3.metric("행수", f"{len(result):,}")
 
-    if file_type == "unknown":
-        st.error("파일 종류를 판별할 수 없습니다. EP채널 또는 EP실적 파일인지 확인해주세요.")
-        st.stop()
+            total = result[(result["BPU"] == "Total") & (result["원부매칭여부"] == "Total") & (result["최저가여부"] == "Total")]
+            if not total.empty:
+                pct_val = total["원부매칭율(%)"].iloc[-1]
+                if pct_val > 200:
+                    st.warning(f"⚠️ 원부매칭율이 {pct_val:.0f}%로 비정상적입니다.")
+                else:
+                    st.caption(f"✅ 원부매칭율 {pct_val:.1f}% — 정상")
 
-    type_label = {"ep_channel": "EP채널 데이터", "ep_traffic": "EP실적 데이터"}[file_type]
-    out_name = {"ep_channel": "ep_data_long.csv", "ep_traffic": "ep_traffic.csv"}[file_type]
+            st.download_button(
+                "⬇️ ep_data_long.csv 다운로드",
+                result.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig"),
+                file_name="ep_data_long.csv", mime="text/csv",
+                use_container_width=True, type="primary",
+            )
+            with st.expander("미리보기 (처음 10행)"):
+                st.dataframe(result.head(10), use_container_width=True, hide_index=True)
 
-    st.info(f"🔍 **{type_label}**로 판별됨 → `{out_name}` 생성")
-
-    with st.spinner("변환 중... (파일 크기에 따라 최대 1~2분 소요될 수 있어요)"):
-        try:
-            if file_type == "ep_channel":
-                result = convert_ep_channel(uploaded, uploaded.name)
-                category_result = None
-            else:
-                result, category_result = convert_ep_traffic(uploaded)
-        except Exception as e:
-            st.error(f"변환 실패: {e}")
-            st.stop()
-
-    date_min = result["날짜"].min()
-    date_max = result["날짜"].max()
-    n_days = result["날짜"].nunique()
-
-    st.success("변환 완료!")
-    c1, c2, c3 = st.columns(3)
-    c1.metric("기간", f"{date_min} ~ {date_max}")
-    c2.metric("일수", f"{n_days}일")
-    c3.metric("행수", f"{len(result):,}")
-
-    # 검증
-    if file_type == "ep_channel":
-        total = result[(result["BPU"] == "Total") & (result["원부매칭여부"] == "Total") & (result["최저가여부"] == "Total")]
-        if not total.empty:
-            pct_val = total["원부매칭율(%)"].iloc[-1]
-            if pct_val > 200:
-                st.warning(f"⚠️ 원부매칭율이 {pct_val:.0f}%로 비정상적입니다.")
-            else:
-                st.caption(f"✅ 원부매칭율 {pct_val:.1f}% — 정상")
-    else:
-        total = result[(result["BPU"] == "Total") & (result["회원구분"] == "전체")]
-        if not total.empty:
-            last_uv = total["트래픽"].iloc[-1]
-            last_gmv = total["거래액"].iloc[-1]
-            st.caption(f"✅ 최신 Total — UV: {last_uv:,.0f} / 거래액: {last_gmv:,.0f}")
-
-    csv_data = result.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
-    st.download_button(
-        f"⬇️ {out_name} 다운로드",
-        csv_data, file_name=out_name, mime="text/csv",
-        use_container_width=True, type="primary",
+# ── ② EP실적 (집계, 카테고리 없음) → ep_traffic.csv ──
+with tab2:
+    st.caption("카테고리/브랜드 구분이 없는, BPU별 순수 집계 파일만 올려주세요.")
+    up_traffic = st.file_uploader("EP실적(집계) 원본 업로드", type=["csv", "xlsx", "xls"], key="up_traffic")
+    other_dept_file = st.file_uploader(
+        "기타부서 파일 (선택 · 있으면 Total에 자동 반영됩니다)",
+        type=["xlsx", "xls"], key="other_dept_main",
     )
+    if up_traffic is not None:
+        detected = detect_file_type(up_traffic)
+        if detected != "ep_traffic":
+            st.error("EP실적 데이터로 보이지 않아요. ①이나 ③ 탭에 올리려던 파일은 아닌가요?")
+        else:
+            with st.spinner("변환 중... (파일 크기에 따라 최대 1~2분 소요될 수 있어요)"):
+                try:
+                    result, category_result = convert_ep_traffic(up_traffic)
+                except Exception as e:
+                    st.error(f"변환 실패: {e}")
+                    st.stop()
 
-    # 카테고리/브랜드 데이터가 함께 추출됐으면 별도 다운로드 제공
-    if category_result is not None and not category_result.empty:
-        st.divider()
-        n_cats = category_result["카테고리"].nunique()
-        n_brands = category_result["브랜드"].nunique()
-        st.info(f"🗂️ 카테고리/브랜드 상세 데이터도 함께 발견됐어요 (카테고리 {n_cats}개, 브랜드 {n_brands}개) → `ep_category.csv` 생성")
-        cat_csv = category_result.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
-        st.download_button(
-            "⬇️ ep_category.csv 다운로드",
-            cat_csv, file_name="ep_category.csv", mime="text/csv",
-            use_container_width=True,
-        )
+            if category_result is not None and not category_result.empty:
+                st.warning(
+                    "⚠️ 이 파일에 카테고리/브랜드 구분이 있는 것 같아요! "
+                    "이 슬롯에서 나온 Total은 카테고리 집계 방식이라 부정확할 수 있어요. "
+                    "③ 탭에 이 파일을 올려서 ep_category.csv만 받아 쓰시고, "
+                    "이 ②탭에는 순수 집계 파일을 따로 올려주세요."
+                )
 
-    st.divider()
-    st.markdown(f"**다운로드한 파일을 GitHub에 덮어쓰면 대시보드가 갱신됩니다.**")
-    with st.expander("미리보기 (처음 10행)"):
-        st.dataframe(result.head(10), use_container_width=True, hide_index=True)
+            other_dept_applied = False
+            if other_dept_file is not None:
+                try:
+                    result, n_adj = merge_other_dept(result, other_dept_file)
+                    other_dept_applied = True
+                    st.success(f"✅ 기타부서 데이터를 Total에 반영했어요 ({n_adj}일 조정됨)")
+                except Exception as e:
+                    st.warning(f"기타부서 반영 실패(원본 EP실적 결과는 정상 생성됨): {e}")
+
+            date_min, date_max = result["날짜"].min(), result["날짜"].max()
+            st.success("변환 완료!")
+            c1, c2, c3 = st.columns(3)
+            c1.metric("기간", f"{date_min} ~ {date_max}")
+            c2.metric("일수", f"{result['날짜'].nunique()}일")
+            c3.metric("행수", f"{len(result):,}")
+            if not other_dept_applied:
+                st.caption("ℹ️ 기타부서 파일을 위에 같이 올리면, Total(전체)에 자동으로 더해서 반영할 수 있어요 (선택 사항).")
+
+            total = result[(result["BPU"] == "Total") & (result["회원구분"] == "전체")]
+            if not total.empty:
+                last_uv = total["트래픽"].iloc[-1]
+                last_gmv = total["거래액"].iloc[-1]
+                st.caption(f"✅ 최신 Total — UV: {last_uv:,.0f} / 거래액: {last_gmv:,.0f}")
+
+            st.download_button(
+                "⬇️ ep_traffic.csv 다운로드",
+                result.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig"),
+                file_name="ep_traffic.csv", mime="text/csv",
+                use_container_width=True, type="primary",
+            )
+            with st.expander("미리보기 (처음 10행)"):
+                st.dataframe(result.head(10), use_container_width=True, hide_index=True)
+
+# ── ③ EP실적 (카테고리·브랜드 포함) → ep_category.csv ──
+with tab3:
+    st.caption("카테고리/브랜드 구분이 있는 상세 파일을 올려주세요. 여기서는 ep_category.csv만 사용합니다.")
+    up_cat = st.file_uploader("EP실적(카테고리 포함) 원본 업로드", type=["csv", "xlsx", "xls"], key="up_cat")
+    if up_cat is not None:
+        detected = detect_file_type(up_cat)
+        if detected != "ep_traffic":
+            st.error("EP실적 데이터로 보이지 않아요. ①이나 ② 탭에 올리려던 파일은 아닌가요?")
+        else:
+            with st.spinner("변환 중... (파일 크기에 따라 최대 1~2분 소요될 수 있어요)"):
+                try:
+                    _ignored_traffic, category_result = convert_ep_traffic(up_cat)
+                except Exception as e:
+                    st.error(f"변환 실패: {e}")
+                    st.stop()
+
+            if category_result is None or category_result.empty:
+                st.error(
+                    "이 파일에서 카테고리/브랜드 구분을 찾지 못했어요. "
+                    "혹시 ② 탭에 올리려던 순수 집계 파일 아닌가요?"
+                )
+            else:
+                n_cats = category_result["카테고리"].nunique()
+                n_brands = category_result["브랜드"].nunique()
+                date_min, date_max = category_result["날짜"].min(), category_result["날짜"].max()
+                st.success(f"변환 완료! 카테고리 {n_cats}개, 브랜드 {n_brands}개")
+                c1, c2, c3 = st.columns(3)
+                c1.metric("기간", f"{date_min} ~ {date_max}")
+                c2.metric("일수", f"{category_result['날짜'].nunique()}일")
+                c3.metric("행수", f"{len(category_result):,}")
+                st.caption("ℹ️ 이 슬롯에서 나온 Total(트래픽/거래액)은 카테고리 합산 방식이라, "
+                          "①UV처럼 개인이 여러 카테고리를 봤을 때 중복 카운트될 수 있어요. "
+                          "EP실적 페이지용 Total은 ② 탭 결과를 사용하세요.")
+
+                st.download_button(
+                    "⬇️ ep_category.csv 다운로드",
+                    category_result.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig"),
+                    file_name="ep_category.csv", mime="text/csv",
+                    use_container_width=True, type="primary",
+                )
+                with st.expander("미리보기 (처음 10행)"):
+                    st.dataframe(category_result.head(10), use_container_width=True, hide_index=True)
+
+st.divider()
+st.markdown("**다운로드한 파일을 GitHub에 각각의 파일명으로 덮어쓰면 대시보드가 갱신됩니다.**")
+
+
 
 
 # ============================================================
-# 기타부서 보정값 확인 (선택 사항 · 가끔 필요할 때만 사용)
+# 기타부서 보정값 미리보기 (빠르게 월별 영향만 확인하고 싶을 때)
 # ============================================================
 st.divider()
-with st.expander("🔧 기타부서 보정값 확인 (선택 사항)"):
+with st.expander("🔍 기타부서 영향 미리보기만 하기 (선택 사항)"):
     st.markdown(
-        "평소 원본 파일에는 **'기타부서' 데이터가 빠져 있어요.** "
-        "사내 시스템에서 기타부서 실적을 따로 뽑으셨다면, 여기에 올려서 "
-        "**Total과 실제 얼마나 차이 나는지 월별로 확인**하고 필요하면 CSV로 받아 수동 보정하세요."
+        "위 메인 업로드에 기타부서 파일을 같이 올리면 **자동으로 Total에 반영**돼요. "
+        "이 아래는 EP실적 원본 없이 **기타부서 파일만으로 월별 영향만 빠르게 확인**하고 싶을 때 쓰세요."
     )
     _other_file = st.file_uploader(
         "기타부서 원본 파일 업로드 (xlsx)", type=["xlsx", "xls"], key="other_dept_upload",
