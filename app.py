@@ -406,3 +406,75 @@ if uploaded is not None:
     st.markdown(f"**다운로드한 파일을 GitHub에 덮어쓰면 대시보드가 갱신됩니다.**")
     with st.expander("미리보기 (처음 10행)"):
         st.dataframe(result.head(10), use_container_width=True, hide_index=True)
+
+
+# ============================================================
+# 기타부서 보정값 확인 (선택 사항 · 가끔 필요할 때만 사용)
+# ============================================================
+st.divider()
+with st.expander("🔧 기타부서 보정값 확인 (선택 사항)"):
+    st.markdown(
+        "평소 원본 파일에는 **'기타부서' 데이터가 빠져 있어요.** "
+        "사내 시스템에서 기타부서 실적을 따로 뽑으셨다면, 여기에 올려서 "
+        "**Total과 실제 얼마나 차이 나는지 월별로 확인**하고 필요하면 CSV로 받아 수동 보정하세요."
+    )
+    _other_file = st.file_uploader(
+        "기타부서 원본 파일 업로드 (xlsx)", type=["xlsx", "xls"], key="other_dept_upload",
+    )
+    if _other_file is not None:
+        try:
+            _odf = pd.read_excel(_other_file, sheet_name=0)
+            _date_cols = [c for c in _odf.columns if str(c).startswith("20")]
+            if not _date_cols:
+                st.error("날짜 컬럼(2025-01-01 형태)을 찾지 못했습니다. 파일 구조를 확인해주세요.")
+            else:
+                _metric_col = _odf.columns[0]
+                _available_metrics = _odf[_metric_col].dropna().unique().tolist()
+                st.caption(f"발견된 지표: {', '.join(str(m) for m in _available_metrics)}")
+
+                _rows = []
+                for _metric in ["트래픽", "거래액"]:
+                    _match = _odf[_odf[_metric_col] == _metric]
+                    if _match.empty:
+                        continue
+                    _row = _match.iloc[0]
+                    for _c in _date_cols:
+                        _v = _row[_c]
+                        try:
+                            _v = float(_v)
+                        except (TypeError, ValueError):
+                            _v = 0.0
+                        _rows.append({"날짜": pd.Timestamp(_c), "지표": _metric, "값": _v})
+
+                _long = pd.DataFrame(_rows)
+                _long["날짜"] = pd.to_datetime(_long["날짜"])
+                _pivot = _long.pivot_table(index="날짜", columns="지표", values="값", aggfunc="sum").fillna(0)
+                _pivot = _pivot.sort_index()
+
+                st.success(f"기타부서 데이터 인식 완료 · 기간: {_pivot.index.min().date()} ~ {_pivot.index.max().date()}")
+
+                # 월별 합계 요약
+                _monthly = _pivot.resample("ME").sum()
+                _monthly.index = _monthly.index.strftime("%Y-%m")
+                st.markdown("**월별 합계 (Total에 추가로 더해야 할 금액)**")
+                st.dataframe(
+                    _monthly.rename(columns={"트래픽": "UV", "거래액": "거래액"})
+                    .style.format("{:,.0f}"),
+                    use_container_width=True,
+                )
+
+                st.caption(
+                    "⚠️ 구매객수/CR/객단가는 이 원본에 없어 계산할 수 없어요. "
+                    "UV·거래액만 Total에 더하면 실제 사내 리포트와 맞아떨어질 거예요."
+                )
+
+                _daily_csv = _pivot.reset_index()
+                _daily_csv["날짜"] = _daily_csv["날짜"].dt.strftime("%Y-%m-%d")
+                st.download_button(
+                    "⬇️ 기타부서_일별.csv 다운로드",
+                    _daily_csv.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig"),
+                    file_name="기타부서_일별.csv", mime="text/csv",
+                    use_container_width=True,
+                )
+        except Exception as e:
+            st.error(f"파일을 읽는 중 문제가 발생했습니다: {e}")
