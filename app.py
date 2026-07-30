@@ -365,6 +365,97 @@ def merge_other_dept(traffic_df, other_file):
     return merged, n_adjusted
 
 
+def parse_coupon_wide(uploaded_file, coupon_type, extra_dims):
+    """'결제_연월' 와이드 포맷(거래액/쿠폰할인 두 블록)을 long 형태로 변환.
+    extra_dims: 메타 컬럼명 리스트 (예: ['AF대분류명','자사입점구분','BPU'])
+    """
+    raw = uploaded_file.read()
+    text = raw.decode("utf-16-le")
+    df = pd.read_csv(io.StringIO(text), sep="\t", header=None, low_memory=False)
+
+    n_meta = len(extra_dims)
+    header_row = df.iloc[2]  # 총계/총계/202501.../쿠폰할인블록 날짜들
+    date_cols_idx = [i for i in range(n_meta + 2, len(df.columns)) if str(header_row.iloc[i]).isdigit()]
+    n_months = len(date_cols_idx) // 2
+    gmv_cols = date_cols_idx[:n_months]
+    coupon_cols = date_cols_idx[n_months:]
+
+    data = df.iloc[3:].reset_index(drop=True)
+    rows = []
+    for _, r in data.iterrows():
+        meta = {dim: r.iloc[i] for i, dim in enumerate(extra_dims)}
+        for gi, ci in zip(gmv_cols, coupon_cols):
+            ym = str(header_row.iloc[gi])
+            gmv_raw = str(r.iloc[gi]).replace(",", "")
+            coupon_raw = str(r.iloc[ci]).replace(",", "")
+            try:
+                gmv = float(gmv_raw)
+            except (TypeError, ValueError):
+                gmv = 0.0
+            try:
+                coupon = float(coupon_raw)
+            except (TypeError, ValueError):
+                coupon = 0.0
+            row = dict(meta)
+            row["연월"] = ym
+            row["자체거래액"] = gmv
+            row["쿠폰할인"] = coupon
+            row["쿠폰유형"] = coupon_type
+            rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _plus_bpu_final(row):
+    """플러스 쿠폰 파일의 '자사입점구분'+'BPU' 2개 컬럼을 하나의 BPU로 통합.
+    (총계,총계)->Total, (자사/입점,총계)->자사/입점 소계, (자사/입점,e-영업N)->e-영업N"""
+    if row["자사입점구분"] == "총계" and row["BPU"] == "총계":
+        return "Total"
+    if row["BPU"] == "총계":
+        return row["자사입점구분"]
+    return row["BPU"]
+
+
+def build_coupon_agg(plus_file, general_file):
+    """쿠폰 집계(BPU 레벨) CSV 생성: 플러스+일반 파일 → ep_coupon.csv 형태."""
+    plus_agg = parse_coupon_wide(plus_file, "플러스", ["AF대분류명", "자사입점구분", "BPU"])
+    general_agg = parse_coupon_wide(general_file, "일반", ["AF대분류명", "BPU"])
+
+    plus_ep = plus_agg[plus_agg["AF대분류명"] == "EP"].copy()
+    general_ep = general_agg[general_agg["AF대분류명"] == "EP"].copy()
+
+    plus_ep["BPU_final"] = plus_ep.apply(_plus_bpu_final, axis=1)
+    general_ep["BPU_final"] = general_ep["BPU"].replace({"총계": "Total"})
+
+    plus_clean = plus_ep[["연월", "BPU_final", "쿠폰유형", "쿠폰할인"]].rename(columns={"BPU_final": "BPU"})
+    general_clean = general_ep[["연월", "BPU_final", "쿠폰유형", "쿠폰할인"]].rename(columns={"BPU_final": "BPU"})
+
+    result = pd.concat([plus_clean, general_clean], ignore_index=True)
+    result["연월"] = pd.to_datetime(result["연월"], format="%Y%m")
+    return result.sort_values(["연월", "쿠폰유형", "BPU"]).reset_index(drop=True)
+
+
+def build_coupon_detail(plus_file, general_file):
+    """쿠폰명별 상세 CSV 생성: 플러스+일반(쿠폰명 포함) 파일 → ep_coupon_detail.csv 형태."""
+    plus_detail = parse_coupon_wide(plus_file, "플러스", ["AF대분류명", "자사입점구분", "BPU", "쿠폰명", "쿠폰ID"])
+    general_detail = parse_coupon_wide(general_file, "일반", ["AF대분류명", "BPU", "쿠폰명", "쿠폰ID"])
+
+    plus_ep = plus_detail[plus_detail["AF대분류명"] == "EP"].copy()
+    general_ep = general_detail[general_detail["AF대분류명"] == "EP"].copy()
+
+    plus_ep["BPU_final"] = plus_ep.apply(_plus_bpu_final, axis=1)
+    general_ep["BPU_final"] = general_ep["BPU"].replace({"총계": "Total"})
+
+    plus_clean = plus_ep[["연월", "BPU_final", "쿠폰명", "쿠폰ID", "쿠폰유형", "쿠폰할인"]].rename(columns={"BPU_final": "BPU"})
+    general_clean = general_ep[["연월", "BPU_final", "쿠폰명", "쿠폰ID", "쿠폰유형", "쿠폰할인"]].rename(columns={"BPU_final": "BPU"})
+
+    result = pd.concat([plus_clean, general_clean], ignore_index=True)
+    result["연월"] = pd.to_datetime(result["연월"], format="%Y%m")
+    # '총계'로 표시된 소계행 제거 (실제 개별 쿠폰만 남김)
+    result = result[(result["쿠폰ID"] != "총계") & (result["쿠폰명"] != "총계")]
+    result = result[result["쿠폰할인"].notna() & (result["쿠폰할인"] != 0)]
+    return result.sort_values(["연월", "쿠폰유형", "쿠폰할인"], ascending=[True, True, False]).reset_index(drop=True)
+
+
 # ─── UI ───
 st.markdown("## 🔄 EP 데이터 변환기")
 st.markdown("사내에서 받은 원본 파일을 대시보드용 CSV로 변환합니다.")
@@ -382,7 +473,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-tab1, tab2, tab3 = st.tabs(["① EP채널", "② EP실적 (집계)", "③ EP실적 (카테고리 포함)"])
+tab1, tab2, tab3, tab4 = st.tabs(["① EP채널", "② EP실적 (집계)", "③ EP실적 (카테고리 포함)", "④ 쿠폰 데이터"])
 
 # ── ① EP채널 ──
 with tab1:
@@ -526,6 +617,72 @@ with tab3:
                 )
                 with st.expander("미리보기 (처음 10행)"):
                     st.dataframe(category_result.head(10), use_container_width=True, hide_index=True)
+
+# ── ④ 쿠폰 데이터 → ep_coupon.csv + ep_coupon_detail.csv ──
+with tab4:
+    st.caption(
+        "사내에서 받은 쿠폰 관련 원본 4종을 각각 맞는 칸에 올려주세요. "
+        "'거래액_플러스'/'거래액_일반'은 집계용(BPU별), "
+        "'거래액_플러스쿠폰명'/'거래액_일반쿠폰명'은 쿠폰명 상세용이에요. "
+        "둘 다 있어야 각각의 결과 파일이 나와요."
+    )
+
+    st.markdown("**BPU 집계용 (ep_coupon.csv)**")
+    cc1, cc2 = st.columns(2)
+    with cc1:
+        coupon_plus_agg_file = st.file_uploader("쿠폰 거래액_플러스 원본", type=["csv"], key="coupon_plus_agg")
+    with cc2:
+        coupon_general_agg_file = st.file_uploader("쿠폰 거래액_일반 원본", type=["csv"], key="coupon_general_agg")
+
+    st.markdown("**쿠폰명 상세용 (ep_coupon_detail.csv)**")
+    cc3, cc4 = st.columns(2)
+    with cc3:
+        coupon_plus_detail_file = st.file_uploader("쿠폰 거래액_플러스쿠폰명 원본", type=["csv"], key="coupon_plus_detail")
+    with cc4:
+        coupon_general_detail_file = st.file_uploader("쿠폰 거래액_일반쿠폰명 원본", type=["csv"], key="coupon_general_detail")
+
+    if coupon_plus_agg_file is not None and coupon_general_agg_file is not None:
+        with st.spinner("쿠폰 집계 데이터 변환 중..."):
+            try:
+                coupon_agg_result = build_coupon_agg(coupon_plus_agg_file, coupon_general_agg_file)
+            except Exception as e:
+                st.error(f"쿠폰 집계 변환 실패: {e}")
+                coupon_agg_result = None
+        if coupon_agg_result is not None:
+            st.success(f"쿠폰 집계 변환 완료! ({coupon_agg_result['연월'].min().strftime('%Y-%m')} ~ {coupon_agg_result['연월'].max().strftime('%Y-%m')})")
+            st.caption(f"BPU: {', '.join(sorted(coupon_agg_result['BPU'].unique()))}")
+            st.download_button(
+                "⬇️ ep_coupon.csv 다운로드",
+                coupon_agg_result.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig"),
+                file_name="ep_coupon.csv", mime="text/csv",
+                use_container_width=True, type="primary", key="dl_coupon_agg",
+            )
+            with st.expander("미리보기 (처음 10행)"):
+                st.dataframe(coupon_agg_result.head(10), use_container_width=True, hide_index=True)
+    else:
+        st.info("위 2개(거래액_플러스, 거래액_일반) 파일을 모두 올리면 ep_coupon.csv가 생성돼요.")
+
+    st.divider()
+
+    if coupon_plus_detail_file is not None and coupon_general_detail_file is not None:
+        with st.spinner("쿠폰 상세 데이터 변환 중... (쿠폰명이 많아 시간이 좀 걸릴 수 있어요)"):
+            try:
+                coupon_detail_result = build_coupon_detail(coupon_plus_detail_file, coupon_general_detail_file)
+            except Exception as e:
+                st.error(f"쿠폰 상세 변환 실패: {e}")
+                coupon_detail_result = None
+        if coupon_detail_result is not None:
+            st.success(f"쿠폰 상세 변환 완료! (고유 쿠폰 {coupon_detail_result['쿠폰ID'].nunique()}개)")
+            st.download_button(
+                "⬇️ ep_coupon_detail.csv 다운로드",
+                coupon_detail_result.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig"),
+                file_name="ep_coupon_detail.csv", mime="text/csv",
+                use_container_width=True, type="primary", key="dl_coupon_detail",
+            )
+            with st.expander("미리보기 (처음 10행)"):
+                st.dataframe(coupon_detail_result.head(10), use_container_width=True, hide_index=True)
+    else:
+        st.info("위 2개(거래액_플러스쿠폰명, 거래액_일반쿠폰명) 파일을 모두 올리면 ep_coupon_detail.csv가 생성돼요.")
 
 st.divider()
 st.markdown("**다운로드한 파일을 GitHub에 각각의 파일명으로 덮어쓰면 대시보드가 갱신됩니다.**")
