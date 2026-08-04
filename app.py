@@ -269,9 +269,12 @@ def _convert_traffic_new(df):
     ep_traffic_result = pd.concat([pivot, total_df], ignore_index=True)
     ep_traffic_result = ep_traffic_result.sort_values(["BPU", "회원구분", "날짜"]).reset_index(drop=True)
 
-    # ── 2. ep_category (카테고리/브랜드 전체 조합, 5개 세그먼트 모두 포함) ──
-    # 예전엔 세그먼트=전체만 뽑아서 회원/비회원/신규/기존 값이 통째로 버려지고 있었음.
-    # iterrows 대신 melt(벡터화)로 처리해서, 세그먼트가 5배 늘어나도 속도 저하를 최소화한다.
+    # ── 2. ep_category (카테고리/브랜드 전체 조합) ──
+    # 5개 세그먼트를 다 넣으면 카테고리×브랜드 조합 수 때문에 파일이 너무 커져서(25MB+,
+    # 깃허브 웹 업로드 제한 초과) 전체/회원/신규 3개만 담는다. 비회원=전체-회원,
+    # 기존=전체-신규 로 나중에 필요하면 역산 가능하고, 필요하면 원본에서 다시 뽑을 수도 있음.
+    # (ep_traffic.csv는 카테고리/브랜드로 곱해지지 않아 용량이 작으므로 5개 세그먼트 그대로 유지)
+    CATEGORY_SEGMENTS = [s for s in SEGMENTS if s[0] in ("전체", "회원", "신규")]
     combos = df.iloc[1:, [5, 6]].drop_duplicates().values.tolist()
     ep_category_result = None
     if len(combos) > 1:  # 카테고리 breakdown이 실제로 있는 파일일 때만
@@ -279,7 +282,7 @@ def _convert_traffic_new(df):
         date_col_positions = [idx for _, idx in date_list]
 
         cat_frames = []
-        for seg_label, member_filter, sinew_filter in SEGMENTS:
+        for seg_label, member_filter, sinew_filter in CATEGORY_SEGMENTS:
             seg_mask = (
                 (df.iloc[:, 2] == member_filter) & (df.iloc[:, 3] == sinew_filter)
                 & (df.iloc[:, 4] == "전체") & df.iloc[:, 0].notna()
