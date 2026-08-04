@@ -269,41 +269,51 @@ def _convert_traffic_new(df):
     ep_traffic_result = pd.concat([pivot, total_df], ignore_index=True)
     ep_traffic_result = ep_traffic_result.sort_values(["BPU", "회원구분", "날짜"]).reset_index(drop=True)
 
-    # ── 2. ep_category (카테고리/브랜드 전체 조합, 세그먼트=전체만, groupby로 빠르게) ──
+    # ── 2. ep_category (카테고리/브랜드 전체 조합, 5개 세그먼트 모두 포함) ──
+    # 예전엔 세그먼트=전체만 뽑아서 회원/비회원/신규/기존 값이 통째로 버려지고 있었음.
+    # iterrows 대신 melt(벡터화)로 처리해서, 세그먼트가 5배 늘어나도 속도 저하를 최소화한다.
     combos = df.iloc[1:, [5, 6]].drop_duplicates().values.tolist()
     ep_category_result = None
     if len(combos) > 1:  # 카테고리 breakdown이 실제로 있는 파일일 때만
-        cat_mask = (df.iloc[:, 2] == "전체") & (df.iloc[:, 3] == "전체") & (df.iloc[:, 4] == "전체") \
-                   & df.iloc[:, 0].notna()
-        sub_df = df[cat_mask].copy()
-        sub_df["_bpu"] = bpu_col[cat_mask]
-
-        date_col_indices = [idx for _, idx in date_list]
         date_strs = [d for d, _ in date_list]
+        date_col_positions = [idx for _, idx in date_list]
 
-        cat_rows = []
-        for metric in ["트래픽", "거래액", "구매객수", "CR", "객단가"]:
-            metric_rows = sub_df[sub_df.iloc[:, 1] == metric]
-            for _, r in metric_rows.iterrows():
-                bpu_val = r["_bpu"]
-                cat_val = r.iloc[5]
-                brand_val = r.iloc[6]
-                for date_str, col_idx in date_list:
-                    v = str(r.iloc[col_idx]).replace(",", "").replace("%", "")
-                    try:
-                        v = float(v)
-                    except:
-                        v = None
-                    cat_rows.append({
-                        "날짜": date_str, "BPU": bpu_val, "카테고리": cat_val,
-                        "브랜드": brand_val, "지표": metric, "값": v,
-                    })
-        cat_long = pd.DataFrame(cat_rows)
-        cat_pivot = cat_long.pivot_table(
-            index=["날짜", "BPU", "카테고리", "브랜드"], columns="지표", values="값", aggfunc="first"
-        ).reset_index()
-        cat_pivot.columns.name = None
-        ep_category_result = cat_pivot.sort_values(["BPU", "카테고리", "브랜드", "날짜"]).reset_index(drop=True)
+        cat_frames = []
+        for seg_label, member_filter, sinew_filter in SEGMENTS:
+            seg_mask = (
+                (df.iloc[:, 2] == member_filter) & (df.iloc[:, 3] == sinew_filter)
+                & (df.iloc[:, 4] == "전체") & df.iloc[:, 0].notna()
+            )
+            sub_df = df[seg_mask]
+            if sub_df.empty:
+                continue
+            melt_src = pd.DataFrame({
+                "BPU": bpu_col[seg_mask].values,
+                "지표": sub_df.iloc[:, 1].values,
+                "카테고리": sub_df.iloc[:, 5].values,
+                "브랜드": sub_df.iloc[:, 6].values,
+            })
+            for date_str, col_idx in zip(date_strs, date_col_positions):
+                melt_src[date_str] = sub_df.iloc[:, col_idx].values
+            long_df = melt_src.melt(
+                id_vars=["BPU", "지표", "카테고리", "브랜드"], var_name="날짜", value_name="값"
+            )
+            long_df["값"] = pd.to_numeric(
+                long_df["값"].astype(str).str.replace(",", "", regex=False).str.replace("%", "", regex=False),
+                errors="coerce",
+            )
+            long_df["회원구분"] = seg_label
+            cat_frames.append(long_df)
+
+        if cat_frames:
+            cat_long = pd.concat(cat_frames, ignore_index=True)
+            cat_pivot = cat_long.pivot_table(
+                index=["날짜", "BPU", "카테고리", "브랜드", "회원구분"], columns="지표", values="값", aggfunc="first"
+            ).reset_index()
+            cat_pivot.columns.name = None
+            ep_category_result = cat_pivot.sort_values(
+                ["BPU", "카테고리", "브랜드", "회원구분", "날짜"]
+            ).reset_index(drop=True)
 
     return ep_traffic_result, ep_category_result
 
