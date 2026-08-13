@@ -139,6 +139,100 @@ def convert_ep_channel(uploaded_file, file_name):
 
 
 # ─── EP실적 변환 ───
+def validate_traffic_conversion(result, other_dept_applied=False):
+    """변환된 ep_traffic 데이터에 대한 자동 점검. (레벨, 메시지) 튜플 리스트를 반환.
+    레벨: "error"(빨강, 명백히 잘못됨) / "warning"(노랑, 확인 필요) / "success"(초록, 정상).
+
+    2026-08-13에 실제로 겪었던 버그들(엑셀 병합 셀 때문에 e-영업1~4 데이터가 통째로
+    누락되는 것 등)이 조용히 다시 생겨도 바로 눈에 띄게 하기 위한 자동 점검."""
+    checks = []
+    if result is None or result.empty:
+        checks.append(("error", "변환 결과가 비어있어요."))
+        return checks
+
+    total = result[(result["BPU"] == "Total") & (result["회원구분"] == "전체")]
+    if total.empty:
+        checks.append(("error", "Total(전체) 행이 없어요."))
+    else:
+        checks.append(("success", f"Total 행 정상 ({len(total)}일치)"))
+
+    # 1) e-영업1~4가 전부 데이터를 갖고 있는지 — 병합 셀 ffill 버그가 재발하면 여기서 잡힘
+    missing_bpu = []
+    for bpu in ["e-영업1", "e-영업2", "e-영업3", "e-영업4"]:
+        sub = result[(result["BPU"] == bpu) & (result["회원구분"] == "전체")]
+        if sub.empty:
+            missing_bpu.append(bpu)
+    if missing_bpu:
+        checks.append((
+            "error",
+            f"{', '.join(missing_bpu)} 데이터가 통째로 없어요! 엑셀 원본의 병합 셀(라벨이 "
+            "그룹 첫 행에만 있고 나머지는 빈칸인 구조) 때문일 가능성이 높아요 — 원본 구조가 "
+            "바뀌었는지 확인이 필요해요.",
+        ))
+    else:
+        checks.append(("success", "e-영업1~4 데이터 전부 존재"))
+
+    # 2) Total ≈ e-영업1~4 합계 (기타부서/비상품랜딩을 반영 안 했으면 어느 정도 차이는 정상)
+    if not total.empty and not missing_bpu:
+        _bpu_sum = result[
+            (result["BPU"].isin(["e-영업1", "e-영업2", "e-영업3", "e-영업4"])) & (result["회원구분"] == "전체")
+        ].groupby("날짜")["거래액"].sum()
+        _total_by_date = total.set_index("날짜")["거래액"]
+        _common_dates = _bpu_sum.index.intersection(_total_by_date.index)
+        if len(_common_dates) > 0:
+            _diff_ratio = (
+                (_total_by_date.loc[_common_dates].sum() - _bpu_sum.loc[_common_dates].sum())
+                / _bpu_sum.loc[_common_dates].sum() * 100
+                if _bpu_sum.loc[_common_dates].sum() else 0
+            )
+            if other_dept_applied:
+                # 기타부서까지 반영했으면 거의 정확히 맞아야 함
+                if abs(_diff_ratio) > 1:
+                    checks.append((
+                        "warning",
+                        f"Total이 e-영업1~4 합계+기타부서와 {_diff_ratio:+.1f}% 차이나요 — 확인해보세요.",
+                    ))
+                else:
+                    checks.append(("success", "Total ≈ e-영업1~4 합계 + 기타부서 (일치)"))
+            else:
+                # 기타부서 미반영이면 Total이 조금 더 큰 게 정상(기타부서/비상품랜딩 몫)
+                if _diff_ratio < -1:
+                    checks.append((
+                        "warning",
+                        f"Total이 e-영업1~4 합계보다 오히려 {abs(_diff_ratio):.1f}% 작아요 — "
+                        "보통 Total ≥ e-영업1~4 합계여야 정상이에요(기타부서/비상품랜딩 몫만큼).",
+                    ))
+                elif _diff_ratio > 30:
+                    checks.append((
+                        "warning",
+                        f"Total이 e-영업1~4 합계보다 {_diff_ratio:.1f}%나 커요 — 기타부서 비중이 "
+                        "너무 크면 원본을 다시 확인해보세요.",
+                    ))
+                else:
+                    checks.append(("success", f"Total이 e-영업1~4 합계보다 {_diff_ratio:.1f}% 큼 (기타부서 등, 정상 범위)"))
+
+    # 3) 음수/이상치 체크 (거래액이 음수인 건 반품 등으로 있을 수 있지만, 트래픽/구매객수 음수는 이상함)
+    for col in ["트래픽", "구매객수"]:
+        if col in result.columns:
+            _neg = (result[col] < 0).sum()
+            if _neg > 0:
+                checks.append(("warning", f"{col}에 음수 값이 {_neg}건 있어요 — 원본을 확인해보세요."))
+
+    # 4) 날짜 연속성 (Total 기준으로 중간에 빠진 날짜가 있는지)
+    if not total.empty:
+        _all_days = pd.date_range(total["날짜"].min(), total["날짜"].max())
+        _missing_days = _all_days.difference(pd.to_datetime(total["날짜"]))
+        if len(_missing_days) > 0:
+            checks.append((
+                "warning",
+                f"기간 중 {len(_missing_days)}일이 비어있어요 (예: {_missing_days[0].strftime('%Y-%m-%d')} 등).",
+            ))
+        else:
+            checks.append(("success", "날짜 연속성 정상 (빠진 날 없음)"))
+
+    return checks
+
+
 def convert_ep_traffic(uploaded_file):
     name = getattr(uploaded_file, "name", "").lower()
     if name.endswith(".xlsx") or name.endswith(".xls"):
@@ -618,6 +712,13 @@ with tab2:
                 last_uv = total["트래픽"].iloc[-1]
                 last_gmv = total["거래액"].iloc[-1]
                 st.caption(f"✅ 최신 Total — UV: {last_uv:,.0f} / 거래액: {last_gmv:,.0f}")
+
+            # 자동 점검 — 병합 셀 누락 등 조용히 생기는 문제를 바로 눈에 띄게 함
+            with st.expander("🔍 자동 점검 결과", expanded=True):
+                _checks = validate_traffic_conversion(result, other_dept_applied)
+                _icon = {"error": "🔴", "warning": "🟡", "success": "🟢"}
+                for _level, _msg in _checks:
+                    st.markdown(f"{_icon[_level]} {_msg}")
 
             st.download_button(
                 "⬇️ ep_traffic.csv 다운로드",
