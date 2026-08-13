@@ -653,12 +653,29 @@ with tab3:
                           "①UV처럼 개인이 여러 카테고리를 봤을 때 중복 카운트될 수 있어요. "
                           "EP실적 페이지용 Total은 ② 탭 결과를 사용하세요.")
 
+                # gzip 압축해서 내려받는다 — 카테고리×브랜드 조합이 많으면 원본 CSV가
+                # 25MB를 넘어서 GitHub 웹 업로드 제한에 걸리기 쉬운데, gzip으로 압축하면
+                # 보통 80% 안팎으로 줄어든다(대시보드 쪽 data_loader.py도 .csv.gz를
+                # 자동으로 읽도록 맞춰뒀음 — pandas가 확장자 보고 알아서 압축 해제함).
+                import gzip as _gzip
+                _csv_bytes = category_result.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+                _gz_bytes = _gzip.compress(_csv_bytes)
+                _mb_before, _mb_after = len(_csv_bytes) / 1024 / 1024, len(_gz_bytes) / 1024 / 1024
+                st.caption(f"📦 원본 {_mb_before:.1f}MB → 압축 후 {_mb_after:.1f}MB")
+
                 st.download_button(
-                    "⬇️ ep_category.csv 다운로드",
-                    category_result.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig"),
-                    file_name="ep_category.csv", mime="text/csv",
+                    "⬇️ ep_category.csv.gz 다운로드 (압축됨)",
+                    _gz_bytes,
+                    file_name="ep_category.csv.gz", mime="application/gzip",
                     use_container_width=True, type="primary",
                 )
+                with st.expander("압축 안 된 원본 CSV로 받기 (파일이 작을 때만 추천)"):
+                    st.download_button(
+                        "⬇️ ep_category.csv 다운로드 (비압축)",
+                        _csv_bytes,
+                        file_name="ep_category.csv", mime="text/csv",
+                        use_container_width=True,
+                    )
                 with st.expander("미리보기 (처음 10행)"):
                     st.dataframe(category_result.head(10), use_container_width=True, hide_index=True)
 
