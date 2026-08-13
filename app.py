@@ -41,21 +41,27 @@ def _parse_date(year_val, md_val):
 
 # ─── 파일 타입 자동 판별 ───
 def detect_file_type(uploaded_file):
-    """파일 내용을 보고 EP채널 / EP실적 자동 판별."""
+    """파일 내용을 보고 EP채널 / EP실적 자동 판별.
+    예전엔 '엑셀이면 무조건 EP채널'이었는데, EP실적/EP상세실적도 엑셀로 올 수 있어서
+    (예: 소수점이 CSV에서 잘리는 문제 때문에 엑셀 원본을 그대로 쓰고 싶은 경우) 잘못
+    판정되고 있었음 — 이제 엑셀도 CSV와 똑같이 내용을 읽어서 판별한다."""
     name = uploaded_file.name.lower()
 
-    # 엑셀이면 무조건 EP채널
     if name.endswith(".xlsx") or name.endswith(".xls"):
-        return "ep_channel"
-
-    # CSV: 내용으로 판별
-    raw = uploaded_file.read(10000)
-    uploaded_file.seek(0)
-
-    if raw[:2] == b"\xff\xfe":
-        text = raw.decode("utf-16-le", errors="ignore")
+        try:
+            preview = pd.read_excel(uploaded_file, sheet_name=0, header=None, nrows=5)
+        except Exception:
+            return "unknown"
+        finally:
+            uploaded_file.seek(0)
+        text = " ".join(str(v) for v in preview.values.flatten() if pd.notna(v))
     else:
-        text = raw.decode("utf-8", errors="ignore")
+        raw = uploaded_file.read(10000)
+        uploaded_file.seek(0)
+        if raw[:2] == b"\xff\xfe":
+            text = raw.decode("utf-16-le", errors="ignore")
+        else:
+            text = raw.decode("utf-8", errors="ignore")
 
     # EP실적 파일 특징: 헤더에 "회원구분"이 있음 (EP채널에는 없는 컬럼)
     if "회원구분" in text:
@@ -134,27 +140,37 @@ def convert_ep_channel(uploaded_file, file_name):
 
 # ─── EP실적 변환 ───
 def convert_ep_traffic(uploaded_file):
-    raw = uploaded_file.read()
-    uploaded_file.seek(0)
-    if raw[:2] == b"\xff\xfe":
-        text = raw.decode("utf-16-le")
-        df = pd.read_csv(io.StringIO(text), sep="\t", header=None, low_memory=False)
+    name = getattr(uploaded_file, "name", "").lower()
+    if name.endswith(".xlsx") or name.endswith(".xls"):
+        # 엑셀 원본 그대로 사용 — CSV로 미리 변환하면 소수점이 잘리는 문제가 있어서,
+        # 엑셀을 직접 읽으면 원본 정밀도가 그대로 보존된다.
+        df = pd.read_excel(uploaded_file, sheet_name=0, header=None)
     else:
-        df = pd.read_csv(uploaded_file, encoding="utf-8-sig", sep=None,
-                         engine="python", header=None, low_memory=False)
+        raw = uploaded_file.read()
+        uploaded_file.seek(0)
+        if raw[:2] == b"\xff\xfe":
+            text = raw.decode("utf-16-le")
+            df = pd.read_csv(io.StringIO(text), sep="\t", header=None, low_memory=False)
+        else:
+            df = pd.read_csv(uploaded_file, encoding="utf-8-sig", sep=None,
+                             engine="python", header=None, low_memory=False)
 
     # --- 구조 자동 판별 ---
+    is_xlsx = name.endswith(".xlsx") or name.endswith(".xls")
     header_row0 = str(df.iloc[0, 0]).strip()
     if header_row0 == "BPU" or header_row0 in ("e-영업1", "e-영업2", "e-영업3", "e-영업4"):
         # 새 구조: 열0=BPU, 열1=지표, 열2=회원구분, 열3=신규구분1, 열4=신규구분2, 열5=카테고리, 열6=브랜드, 열7~=날짜
-        return _convert_traffic_new(df)  # (ep_traffic_df, ep_category_df_or_None)
+        return _convert_traffic_new(df, is_xlsx)  # (ep_traffic_df, ep_category_df_or_None)
     else:
         # 기존 구조: 열0=지표, 열1=회원구분, 열2=신규구분1, 열3=신규구분2, 열4=구분, 열5=BPU, 열6~=날짜
-        return _convert_traffic_old(df), None
+        return _convert_traffic_old(df, is_xlsx), None
 
 
-def _convert_traffic_old(df):
-    """기존 EP실적 구조 (열0=지표, 열5=BPU, 열4=구분)."""
+def _convert_traffic_old(df, is_xlsx=False):
+    """기존 EP실적 구조 (열0=지표, 열5=BPU, 열4=구분).
+    is_xlsx: 엑셀에서 읽은 경우, CR(%) 셀이 엑셀의 '%서식' 때문에 0.033같은 분수로
+    읽힌다(CSV/기존 파이프라인은 3.3처럼 이미 100배 된 값). 그대로 두면 대시보드 전체의
+    구매전환율이 100배 작게 나오게 되므로, 엑셀 소스일 때만 CR을 ×100 보정한다."""
     col0 = df.iloc[:, 0].ffill()
     date_cols = {}
     for c in range(6, df.shape[1]):
@@ -194,14 +210,17 @@ def _convert_traffic_old(df):
                         val = float(val)
                     except:
                         val = None
+                    if val is not None and metric == "CR" and is_xlsx:
+                        val = val * 100
                     rows.append({"날짜": date_str, "BPU": bpu_label,
                                  "회원구분": seg_label, "지표": metric, "값": val})
     return _pivot_traffic(rows)
 
 
-def _convert_traffic_new(df):
+def _convert_traffic_new(df, is_xlsx=False):
     """새 EP실적 구조 (열0=BPU, 열1=지표, 열5=카테고리, 열6=브랜드).
     Total 행이 없으므로 BPU 합산으로 만든다.
+    is_xlsx: CR(%) 값이 엑셀 %서식 때문에 분수(0.033)로 읽히는 문제 보정용 (아래 참고).
     반환: (ep_traffic 형태 DataFrame, ep_category 형태 DataFrame or None)
     """
     bpu_col = df.iloc[:, 0].ffill()
@@ -239,6 +258,8 @@ def _convert_traffic_new(df):
                         val = float(val)
                     except:
                         val = None
+                    if val is not None and metric == "CR" and is_xlsx:
+                        val = val * 100
                     rows.append({"날짜": date_str, "BPU": bpu,
                                  "회원구분": seg_label, "지표": metric, "값": val})
 
@@ -305,6 +326,9 @@ def _convert_traffic_new(df):
                 long_df["값"].astype(str).str.replace(",", "", regex=False).str.replace("%", "", regex=False),
                 errors="coerce",
             )
+            if is_xlsx:
+                _cr_mask = long_df["지표"] == "CR"
+                long_df.loc[_cr_mask, "값"] = long_df.loc[_cr_mask, "값"] * 100
             long_df["회원구분"] = seg_label
             cat_frames.append(long_df)
 
