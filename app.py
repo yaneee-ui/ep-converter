@@ -223,7 +223,18 @@ def _convert_traffic_new(df, is_xlsx=False):
     is_xlsx: CR(%) 값이 엑셀 %서식 때문에 분수(0.033)로 읽히는 문제 보정용 (아래 참고).
     반환: (ep_traffic 형태 DataFrame, ep_category 형태 DataFrame or None)
     """
+    # 라벨 컬럼(BPU/지표/회원구분/신규구분1/신규구분2/카테고리)이 전부 엑셀 원본에서
+    # 병합 셀 형태다 — 각 그룹의 첫 행에만 값이 있고 나머지 행은 비어있다(엑셀에서
+    # 시각적으로는 "이어지는 것처럼" 보이지만 실제 셀 값은 빈 칸). 전부 ffill로
+    # 앞의 값을 채워야 카테고리/브랜드별 세부 행들이 올바르게 매칭된다 — 이게 안 돼서
+    # 카테고리별 상세 데이터 대부분이 누락되는 문제가 있었음. 브랜드(열6)만 매 행마다
+    # 자기 값이 있어서 ffill이 필요 없다(확인함).
     bpu_col = df.iloc[:, 0].ffill()
+    metric_col = df.iloc[:, 1].ffill()
+    member_col = df.iloc[:, 2].ffill()
+    sinew1_col = df.iloc[:, 3].ffill()
+    sinew2_col = df.iloc[:, 4].ffill()
+    category_col = df.iloc[:, 5].ffill()
 
     date_cols = {}
     for c in range(7, df.shape[1]):
@@ -245,9 +256,9 @@ def _convert_traffic_new(df, is_xlsx=False):
     for bpu in ["e-영업1", "e-영업2", "e-영업3", "e-영업4"]:
         for metric in ["트래픽", "거래액", "구매객수", "CR", "객단가"]:
             for seg_label, member_filter, sinew_filter in SEGMENTS:
-                mask = ((bpu_col == bpu) & (df.iloc[:, 1] == metric) &
-                        (df.iloc[:, 2] == member_filter) & (df.iloc[:, 3] == sinew_filter) &
-                        (df.iloc[:, 4] == "전체") & (df.iloc[:, 5] == "전체") & (df.iloc[:, 6] == "전체"))
+                mask = ((bpu_col == bpu) & (metric_col == metric) &
+                        (member_col == member_filter) & (sinew1_col == sinew_filter) &
+                        (sinew2_col == "전체") & (category_col == "전체") & (df.iloc[:, 6] == "전체"))
                 matched = df[mask]
                 if matched.empty:
                     continue
@@ -296,7 +307,7 @@ def _convert_traffic_new(df, is_xlsx=False):
     # 기존=전체-신규 로 나중에 필요하면 역산 가능하고, 필요하면 원본에서 다시 뽑을 수도 있음.
     # (ep_traffic.csv는 카테고리/브랜드로 곱해지지 않아 용량이 작으므로 5개 세그먼트 그대로 유지)
     CATEGORY_SEGMENTS = [s for s in SEGMENTS if s[0] in ("전체", "회원", "신규")]
-    combos = df.iloc[1:, [5, 6]].drop_duplicates().values.tolist()
+    combos = pd.DataFrame({"카테고리": category_col.iloc[1:], "브랜드": df.iloc[1:, 6]}).drop_duplicates().values.tolist()
     ep_category_result = None
     if len(combos) > 1:  # 카테고리 breakdown이 실제로 있는 파일일 때만
         date_strs = [d for d, _ in date_list]
@@ -305,16 +316,16 @@ def _convert_traffic_new(df, is_xlsx=False):
         cat_frames = []
         for seg_label, member_filter, sinew_filter in CATEGORY_SEGMENTS:
             seg_mask = (
-                (df.iloc[:, 2] == member_filter) & (df.iloc[:, 3] == sinew_filter)
-                & (df.iloc[:, 4] == "전체") & df.iloc[:, 0].notna()
+                (member_col == member_filter) & (sinew1_col == sinew_filter)
+                & (sinew2_col == "전체")
             )
             sub_df = df[seg_mask]
             if sub_df.empty:
                 continue
             melt_src = pd.DataFrame({
                 "BPU": bpu_col[seg_mask].values,
-                "지표": sub_df.iloc[:, 1].values,
-                "카테고리": sub_df.iloc[:, 5].values,
+                "지표": metric_col[seg_mask].values,
+                "카테고리": category_col[seg_mask].values,
                 "브랜드": sub_df.iloc[:, 6].values,
             })
             for date_str, col_idx in zip(date_strs, date_col_positions):
