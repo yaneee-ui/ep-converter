@@ -171,7 +171,16 @@ def _convert_traffic_old(df, is_xlsx=False):
     is_xlsx: 엑셀에서 읽은 경우, CR(%) 셀이 엑셀의 '%서식' 때문에 0.033같은 분수로
     읽힌다(CSV/기존 파이프라인은 3.3처럼 이미 100배 된 값). 그대로 두면 대시보드 전체의
     구매전환율이 100배 작게 나오게 되므로, 엑셀 소스일 때만 CR을 ×100 보정한다."""
+    # 라벨 컬럼(회원구분/신규구분1/신규구분2/구분)이 전부 엑셀 원본에서 병합 셀 형태다 —
+    # 그룹 첫 행에만 값이 있고 나머지는 비어있다. ffill 안 하면 e-영업1~4 같은 상세 행들이
+    # 전부 조건에 안 맞아서(NaN != "전체" 등) 통째로 누락된다 — 이게 빠져서 e-영업1~4
+    # 데이터가 하나도 안 나오고 Total만 나오던 문제가 있었음. BPU(열5)만 매 행 값이
+    # 있어서 ffill이 필요 없다.
     col0 = df.iloc[:, 0].ffill()
+    member_col = df.iloc[:, 1].ffill()
+    sinew1_col = df.iloc[:, 2].ffill()
+    sinew2_col = df.iloc[:, 3].ffill()
+    gubun_col = df.iloc[:, 4].ffill()
     date_cols = {}
     for c in range(6, df.shape[1]):
         v = str(df.iloc[0, c])
@@ -197,9 +206,9 @@ def _convert_traffic_old(df, is_xlsx=False):
     for bpu_label, gubun, bpu_val in targets:
         for metric in ["트래픽", "거래액", "구매객수", "CR", "객단가"]:
             for seg_label, member_filter, sinew_filter in SEGMENTS:
-                mask = ((col0 == metric) & (df.iloc[:, 1] == member_filter) &
-                        (df.iloc[:, 2] == sinew_filter) & (df.iloc[:, 3] == "전체") &
-                        (df.iloc[:, 4] == gubun) & (df.iloc[:, 5] == bpu_val))
+                mask = ((col0 == metric) & (member_col == member_filter) &
+                        (sinew1_col == sinew_filter) & (sinew2_col == "전체") &
+                        (gubun_col == gubun) & (df.iloc[:, 5] == bpu_val))
                 matched = df[mask]
                 if matched.empty:
                     continue
